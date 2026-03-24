@@ -19,7 +19,7 @@ module tb_top;
     tb_stream_if pif(.clk(clk));
 
     // DUT instantiation
-    imageProcessTop dut(
+    ImageProcessTop dut(
         .aclk        (clk),
         .aresetn    (pif.rst),
         .s_axis_tvalid  (pif.in_data_valid),

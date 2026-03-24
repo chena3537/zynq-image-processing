@@ -3,8 +3,8 @@ import time
 
 PORT        = 'COM4'
 BAUD_RATE   = 115200
-IMAGE_IN    = 'input.bmp'
-IMAGE_OUT   = 'output.bmp'
+IMAGE_IN    = "../images/input.bmp"
+IMAGE_OUT   = "../images/output.bmp"
 HEADER_SIZE = 1078
 IMAGE_SIZE  = 512 * 512
 CHUNK_SIZE  = 1024
