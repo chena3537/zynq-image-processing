@@ -7,4 +7,5 @@ interface tb_stream_if(input logic clk);
     logic        out_data_valid;
     logic        in_data_ready;
     logic        out_intr;
+    logic        m_axis_tlast;
 endinterface

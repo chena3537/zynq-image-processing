@@ -26,6 +26,7 @@ module ImageProcessTop #(
 
     output wire        m_axis_tvalid,
     output wire [7:0]  m_axis_tdata,
+    output wire        m_axis_tlast,
     input  wire        m_axis_tready,
 
     // Interrupt: pulses one cycle per completed 512-pixel read pass
@@ -42,6 +43,30 @@ module ImageProcessTop #(
     wire        conv_data_valid;
 
     wire        fifo_prog_full;
+
+
+
+    localparam FRAME_SIZE = LINE_LEN * NUM_ROWS;        
+    localparam CNT_W      = $clog2(FRAME_SIZE);      
+ 
+    reg [CNT_W-1:0] out_pixel_cnt;               
+ 
+    always @(posedge aclk) begin                           
+        if (~aresetn) begin                                  
+            out_pixel_cnt <= {CNT_W{1'b0}};                     
+        end else if (m_axis_tvalid && m_axis_tready) begin        
+            // Advance only on completed transfers (both sides ready)
+            if (out_pixel_cnt == FRAME_SIZE - 1)
+                out_pixel_cnt <= {CNT_W{1'b0}};
+            else
+                out_pixel_cnt <= out_pixel_cnt + 1'b1;
+        end                                                      
+    end                                                            
+ 
+    // Assert tlast only on the last pixel of the frame
+    assign m_axis_tlast = m_axis_tvalid &&                         
+                          (out_pixel_cnt == FRAME_SIZE - 1);
+
 
     // Back-pressure: tell the source to pause when the output FIFO is nearly full
     assign s_axis_tready = ~fifo_prog_full;

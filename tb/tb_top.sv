@@ -27,6 +27,7 @@ module tb_top;
         .s_axis_tready (pif.out_data_ready),
         .m_axis_tvalid (pif.out_data_valid),
         .m_axis_tdata       (pif.out_data),
+        .m_axis_tlast   (pif.m_axis_tlast),
         .m_axis_tready  (pif.in_data_ready),
         .out_intr       (pif.out_intr)
     );
