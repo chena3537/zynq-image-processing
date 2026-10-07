@@ -10,6 +10,10 @@ RTL is portable to any AXI4-Stream capable Xilinx device. Images must be 512×51
 
 - **Configurable 3×3 kernel** — signed 8-bit coefficients support smoothing
   filters (box blur, Gaussian) and derivative filters (Sobel, Laplacian).
+- **Runtime kernel select via board switches** — `sw[1:0]` selects one of four
+  kernels (`00` sharpen, `01` box blur, `10` Gaussian blur, `11` edge detect).
+  Switch updates are applied after the final pixel transfer of each 512×512
+  frame so every output frame uses a single kernel.
 - **Saturating output** — post-normalisation results are clamped to \[0, 255\]
   rather than wrapping, producing correct output for mixed-sign kernels.
 - **AXI4-Stream I/O** — slave input and master output use standard

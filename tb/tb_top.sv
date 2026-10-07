@@ -24,6 +24,7 @@ module tb_top;
         .aresetn    (pif.rst),
         .s_axis_tvalid  (pif.in_data_valid),
         .s_axis_tdata        (pif.in_data),
+        .sw           (pif.sw),
         .s_axis_tready (pif.out_data_ready),
         .m_axis_tvalid (pif.out_data_valid),
         .m_axis_tdata       (pif.out_data),
@@ -35,6 +36,7 @@ module tb_top;
     // Reset generation
     initial begin
         pif.rst          <= 0;
+        pif.sw           <= 2'b00;
         pif.in_data_valid <= 0;
         pif.in_data       <= 0;
         pif.in_data_ready <= 1;

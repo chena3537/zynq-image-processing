@@ -1,5 +1,6 @@
 interface tb_stream_if(input logic clk);
     logic        rst;
+    logic [1:0]  sw;
     logic [7:0]  in_data;
     logic        in_data_valid;
     logic        out_data_ready;

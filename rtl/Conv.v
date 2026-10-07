@@ -3,25 +3,26 @@
 // Module Name: Conv
 //
 // Description:
-// Applies a 3x3 signed convolution kernel to a stream of 9-pixel windows.
+// Applies a selectable 3x3 signed convolution kernel to a stream of
+// 9-pixel windows.
 //
-// Kernel coefficients are signed 8-bit, set in the
-// initial block below. Update KERNEL_SUM to match the sum of coefficients.
-// Kernels with a zero coefficient sum (Sobel, Laplacian) are not compatible
-// with the divide-normalisation step without modifying the output stage.
+// kernel_select chooses one of four preset kernels:
+//   00 sharpen, 01 box blur, 10 Gaussian blur, 11 edge detect.
+//
+// Each preset uses a matching divisor in the normalisation stage.
 //
 // Pipeline latency: 2 clock cycles.
 //   Stage 1: nine parallel signed multiplies (registered).
-//   Stage 2: product accumulator, divide by KERNEL_SUM,
+//   Stage 2: product accumulator, divide by preset divisor,
 //            saturating clamp to [0, 255], registered output.
 //
 //////////////////////////////////////////////////////////////////////////////////
 
 module Conv #(
-    parameter NUM_TAPS   = 9,  // 3×3 kernel - do not change without resizing accumulator
-    parameter KERNEL_SUM = 1   // sum of all kernel coefficients; must match values below
+    parameter NUM_TAPS   = 9   // 3x3 kernel - do not change without resizing accumulator
 )(
     input  wire        clk,
+    input  wire [1:0]  kernel_select,
 
     input  wire [71:0] in_pixel_data,
     input  wire        in_pixel_data_valid,
@@ -30,24 +31,77 @@ module Conv #(
     output reg         out_conv_data_valid
 );
 
-    // =========================================================================
-    // Pixel-to-kernel index mapping
-    //   KERNEL[0] → row 0 col 0,  KERNEL[1] → row 0 col 1,  KERNEL[2] → row 0 col 2
-    //   KERNEL[3] → row 1 col 0,  KERNEL[4] → row 1 col 1,  KERNEL[5] → row 1 col 2
-    //   KERNEL[6] → row 2 col 0,  KERNEL[7] → row 2 col 1,  KERNEL[8] → row 2 col 2
-    // =========================================================================
+    localparam [1:0] KERNEL_SHARPEN  = 2'b00;
+    localparam [1:0] KERNEL_BOX_BLUR = 2'b01;
+    localparam [1:0] KERNEL_GAUSS    = 2'b10;
+    localparam [1:0] KERNEL_EDGE     = 2'b11;
 
-    reg signed [7:0] KERNEL [0:NUM_TAPS-1];
-    integer k;
-    initial begin
-        KERNEL[0] =  0; KERNEL[1] = -1; KERNEL[2] =  0;
-        KERNEL[3] = -1; KERNEL[4] =  5; KERNEL[5] = -1;
-        KERNEL[6] =  0; KERNEL[7] = -1; KERNEL[8] =  0;
-    end
+    function signed [7:0] kernel_coeff;
+        input [1:0] sel;
+        input integer idx;
+        begin
+            case (sel)
+                KERNEL_SHARPEN: begin
+                    case (idx)
+                        0: kernel_coeff = 8'sd0;
+                        1: kernel_coeff = -8'sd1;
+                        2: kernel_coeff = 8'sd0;
+                        3: kernel_coeff = -8'sd1;
+                        4: kernel_coeff = 8'sd5;
+                        5: kernel_coeff = -8'sd1;
+                        6: kernel_coeff = 8'sd0;
+                        7: kernel_coeff = -8'sd1;
+                        default: kernel_coeff = 8'sd0;
+                    endcase
+                end
+                KERNEL_BOX_BLUR: begin
+                    kernel_coeff = 8'sd1;
+                end
+                KERNEL_GAUSS: begin
+                    case (idx)
+                        0: kernel_coeff = 8'sd1;
+                        1: kernel_coeff = 8'sd2;
+                        2: kernel_coeff = 8'sd1;
+                        3: kernel_coeff = 8'sd2;
+                        4: kernel_coeff = 8'sd4;
+                        5: kernel_coeff = 8'sd2;
+                        6: kernel_coeff = 8'sd1;
+                        7: kernel_coeff = 8'sd2;
+                        default: kernel_coeff = 8'sd1;
+                    endcase
+                end
+                default: begin
+                    case (idx)
+                        0: kernel_coeff = -8'sd1;
+                        1: kernel_coeff = -8'sd1;
+                        2: kernel_coeff = -8'sd1;
+                        3: kernel_coeff = -8'sd1;
+                        4: kernel_coeff = 8'sd8;
+                        5: kernel_coeff = -8'sd1;
+                        6: kernel_coeff = -8'sd1;
+                        7: kernel_coeff = -8'sd1;
+                        default: kernel_coeff = -8'sd1;
+                    endcase
+                end
+            endcase
+        end
+    endfunction
+
+    function signed [7:0] kernel_divisor;
+        input [1:0] sel;
+        begin
+            case (sel)
+                KERNEL_BOX_BLUR: kernel_divisor = 8'sd9;
+                KERNEL_GAUSS:    kernel_divisor = 8'sd16;
+                default:         kernel_divisor = 8'sd1;
+            endcase
+        end
+    endfunction
 
     
     reg signed [15:0] products [0:NUM_TAPS-1];
     reg               productsValid;
+    reg        [1:0]  kernel_select_d;
 
     genvar g;
     generate
@@ -55,7 +109,7 @@ module Conv #(
             always @(posedge clk) begin
                 // Zero-extend unsigned pixel to signed 9-bit, then multiply by
                 // signed 8-bit coefficient to get a correct signed 16-bit product.
-                products[g] <= $signed({1'b0, in_pixel_data[g*8 +: 8]}) * KERNEL[g];
+                products[g] <= $signed({1'b0, in_pixel_data[g*8 +: 8]}) * kernel_coeff(kernel_select, g);
             end
         end
     endgenerate
@@ -63,17 +117,22 @@ module Conv #(
     always @(posedge clk)
         productsValid <= in_pixel_data_valid;
 
+    always @(posedge clk)
+        kernel_select_d <= kernel_select;
+
     
     integer i;
     reg signed [19:0] acc;   // combinational accumulator
     reg signed [19:0] normalised;
+    reg signed [7:0]  divisor;
 
     always @(*) begin
         acc = 20'sd0;
         for (i = 0; i < NUM_TAPS; i = i + 1)
             acc = acc + products[i];
 
-        normalised = acc / $signed(KERNEL_SUM);
+        divisor = kernel_divisor(kernel_select_d);
+        normalised = acc / $signed(divisor);
     end
 
     always @(posedge clk) begin

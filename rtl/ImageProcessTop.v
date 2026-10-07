@@ -22,6 +22,7 @@ module ImageProcessTop #(
 
     input  wire        s_axis_tvalid,
     input  wire [7:0]  s_axis_tdata,
+    input  wire [1:0]  sw,
     output wire        s_axis_tready,
 
     output wire        m_axis_tvalid,
@@ -42,7 +43,11 @@ module ImageProcessTop #(
     wire [7:0]  conv_data;
     wire        conv_data_valid;
 
+    reg  [1:0]  kernel_select_latched;
+    reg  [1:0]  kernel_select_pending;
+
     wire        fifo_prog_full;
+    wire        frame_end_transfer;
 
 
 
@@ -67,6 +72,21 @@ module ImageProcessTop #(
     assign m_axis_tlast = m_axis_tvalid &&                         
                           (out_pixel_cnt == FRAME_SIZE - 1);
 
+    assign frame_end_transfer = m_axis_tvalid && m_axis_tready && m_axis_tlast;
+
+    // Capture switch state continuously, but only apply it to the active
+    // kernel selector after the final output pixel of each frame transfers.
+    always @(posedge aclk) begin
+        if (rst) begin
+            kernel_select_latched <= sw[1:0];
+            kernel_select_pending <= sw[1:0];
+        end else begin
+            kernel_select_pending <= sw[1:0];
+            if (frame_end_transfer)
+                kernel_select_latched <= kernel_select_pending;
+        end
+    end
+
 
     // Back-pressure: tell the source to pause when the output FIFO is nearly full
     assign s_axis_tready = ~fifo_prog_full;
@@ -88,6 +108,7 @@ module ImageProcessTop #(
         .NUM_TAPS (9)
     ) u_Conv (
         .clk                 (aclk),
+        .kernel_select       (kernel_select_latched),
         .in_pixel_data       (pixel_window),
         .in_pixel_data_valid (pixel_window_valid),
         .out_conv_data       (conv_data),
