@@ -1,0 +1,20 @@
+# Generated Vivado / Vitis projects, reports and simulation output
+/build/
+
+# Vivado / xsim droppings when tools are run from the repo root
+.Xil/
+xsim.dir/
+*.jou
+*.log
+*.pb
+*.wdb
+
+__pycache__/
+dfx_runtime.txt
+
+# Tracked Tcl sources (re-included over local `*.tcl` / `vivado/` exclude rules)
+!/scripts/vivado/
+!/bd/*.tcl
+!/scripts/vivado/*.tcl
+!/scripts/hw/*.tcl
+!/scripts/sim/*.tcl
