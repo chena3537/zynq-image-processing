@@ -30,6 +30,18 @@ if {![file exists $PROJ_FILE]} {
 }
 open_project $PROJ_FILE
 
+# The RTL (ImageProcessTop and below) enters the block design as a module
+# reference with its own out-of-context synthesis run. Vivado does not mark
+# that run stale when the RTL changes, so refresh the reference on every
+# build. The refresh deletes the run; regenerate the BD and recreate it.
+set bd_file [get_files image_pipeline.bd]
+set modrefs [get_ips -quiet -filter {IPDEF =~ "*:module_ref:*"}]
+if {[llength $modrefs]} {
+    update_module_reference $modrefs
+}
+generate_target all $bd_file
+create_ip_run $bd_file
+
 reset_run synth_1
 launch_runs synth_1 -jobs $JOBS
 wait_on_run synth_1
