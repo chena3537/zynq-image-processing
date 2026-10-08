@@ -24,6 +24,7 @@ Windows path length:
 import os
 import shutil
 import stat
+import subprocess
 import sys
 
 import vitis
@@ -43,6 +44,16 @@ APP_NAME      = "image_processing_app"
 # (.../gen_bsp/libsrc/standalone/src/CMakeFiles/.../cpputest_time.c.obj.d).
 BSP_PATH_SUFFIX_LEN = 162
 MAX_PATH = 259
+
+
+def _stop_server(client):
+    """On Windows the Vitis API starts its server through cmd.exe, and
+    vitis.dispose() kills only that cmd.exe; the Java server survives and
+    keeps the workspace locked. Kill the whole process tree instead."""
+    proc = getattr(getattr(client, "_serverObj", None), "cp", None)
+    if os.name == "nt" and proc is not None and proc.poll() is None:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       capture_output=True)
 
 
 def _remove_readonly(func, path, _exc):
@@ -89,6 +100,7 @@ def main():
                          is_skip_copy_sources=True)
         app.build()
     finally:
+        _stop_server(client)
         vitis.dispose()
 
     elf = os.path.join(WORKSPACE, APP_NAME, "build", APP_NAME + ".elf")

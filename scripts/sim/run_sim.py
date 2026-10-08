@@ -73,6 +73,9 @@ TESTS = [
     dict(name="hd_rgb", size=(1280, 720, 3), check_rate=True,
          frames=[("rand", 2), ("rand", 3)],
          doc="720p RGB at full rate (HDMI configuration)"),
+    # Directed (non-UVM) tests: a self-checking top module that prints a marker
+    dict(name="dma_harness", directed="tb_harness", marker="HARNESS PASSED",
+         doc="AxisFramer -> core -> AxisDeframer, as used with the AXI DMA"),
 ]
 
 
@@ -98,17 +101,23 @@ def run(cmd, cwd, log_name):
     return proc.returncode == 0, proc.stdout
 
 
+def rtl_sources():
+    """All Verilog under rtl/, including subdirectories such as rtl/harness."""
+    files = []
+    for root, _, names in os.walk(REPO_ROOT + "/rtl"):
+        files += [root.replace("\\", "/") + "/" + n for n in names if n.endswith(".v")]
+    return sorted(files)
+
+
 def compile_snapshot(width, height, channels, waves):
     """Compile RTL + testbench for one DUT size; return (snapshot dir, error)."""
     cfg = f"{width}x{height}x{channels}" + ("_waves" if waves else "")
     work = BUILD + "/_compile/" + cfg
     os.makedirs(work, exist_ok=True)
 
-    rtl = sorted(REPO_ROOT + "/rtl/" + f
-                 for f in os.listdir(REPO_ROOT + "/rtl") if f.endswith(".v"))
     tb_dir = REPO_ROOT + "/tb"
     steps = [
-        ([tool("xvlog")] + rtl, "xvlog_rtl.log"),
+        ([tool("xvlog")] + rtl_sources(), "xvlog_rtl.log"),
         ([tool("xvlog"), "-sv", "-L", "uvm", "-i", tb_dir,
           tb_dir + "/tb_top.sv"], "xvlog_tb.log"),
         ([tool("xelab"), "tb_top", "-L", "uvm", "-s", "tb", "-timescale", "1ns/1ps",
@@ -123,6 +132,39 @@ def compile_snapshot(width, height, channels, waves):
             errors = [l for l in out.splitlines() if "ERROR" in l]
             return work, "\n".join(errors[:20]) or f"{log} failed"
     return work, None
+
+
+def run_directed(test, waves):
+    """Compile and run a self-checking top module; pass on its marker line."""
+    top = test["directed"]
+    tdir = BUILD + "/" + test["name"]
+    work = BUILD + "/_compile/" + top + ("_waves" if waves else "")
+    os.makedirs(tdir, exist_ok=True)
+    os.makedirs(work, exist_ok=True)
+    steps = [
+        ([tool("xvlog")] + rtl_sources(), "xvlog_rtl.log"),
+        ([tool("xvlog"), "-sv", REPO_ROOT + "/tb/" + top + ".sv"], "xvlog_tb.log"),
+        ([tool("xelab"), top, "-s", top, "-timescale", "1ns/1ps",
+          "-debug", "typical" if waves else "off"], "xelab.log"),
+    ]
+    for cmd, log in steps:
+        ok, out = run(cmd, work, log)
+        if not ok:
+            errors = [l for l in out.splitlines() if "ERROR" in l]
+            return False, f"compile failed ({work}):\n" + ("\n".join(errors[:20]) or log)
+    cmd = [tool("xsim"), top, "-log", tdir + "/xsim.log"]
+    if waves:
+        with open(tdir + "/waves.tcl", "w") as f:
+            f.write("log_wave -recursive *\nrun all\nquit\n")
+        cmd += ["-wdb", tdir + "/waves.wdb", "-tclbatch", tdir + "/waves.tcl"]
+    else:
+        cmd += ["-R"]
+    run(cmd, work, "xsim_" + test["name"] + ".log")
+    log = open(tdir + "/xsim.log", errors="replace").read() if os.path.exists(tdir + "/xsim.log") else ""
+    if test["marker"] in log:
+        return True, ""
+    problems = [l.strip() for l in log.splitlines() if "ERROR" in l or "FAILED" in l]
+    return False, "\n".join(problems[:15]) or f"no result; see {tdir}/xsim.log"
 
 
 def make_frames(test, seed):
@@ -150,6 +192,8 @@ def make_frames(test, seed):
 
 
 def run_test(test, seed, waves):
+    if "directed" in test:
+        return run_directed(test, waves)
     width, height, channels = test["size"]
     tdir = BUILD + "/" + test["name"]
     os.makedirs(tdir, exist_ok=True)
@@ -222,8 +266,8 @@ def main():
 
     if args.list:
         for t in TESTS:
-            w, h, c = t["size"]
-            print(f"{t['name']:16} {w}x{h}x{c:<3} {t['doc']}")
+            size = "x".join(map(str, t["size"])) if "size" in t else "directed"
+            print(f"{t['name']:16} {size:12} {t['doc']}")
         return 0
 
     by_name = {t["name"]: t for t in TESTS}
