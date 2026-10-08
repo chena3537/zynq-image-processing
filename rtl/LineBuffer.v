@@ -1,57 +1,40 @@
 `timescale 1ns / 1ps
 //////////////////////////////////////////////////////////////////////////////////
-// Module Name: lineBuffer
+// Module Name: LineBuffer
 //
 // Description:
-// Single-row pixel store with a 3-pixel wide combinational read port.
+// One image line of storage: a simple dual-port RAM with one write port and
+// one synchronous read port (one cycle read latency), so it infers block RAM.
 //
-// Pixels are written sequentially via in_data/in_wr_en. On each cycle
-// that in_rd_en is asserted, out_data presents three consecutive pixels
-// starting at the current read pointer.
+// Reading and writing the same address in the same cycle is not supported;
+// WindowGen never does (its read and write addresses are always one slot
+// apart).
 //////////////////////////////////////////////////////////////////////////////////
 
 module LineBuffer #(
-    parameter LINE_LEN = 512   // number of pixels per line
+    parameter DEPTH  = 512,   // pixels per line
+    parameter DATA_W = 8      // bits per pixel
 )(
-    input  wire        clk,
-    input  wire        rst,
+    input  wire                     clk,
 
-    // Write port
-    input  wire [7:0]  in_data,
-    input  wire        in_wr_en,
+    input  wire                     wr_en,
+    input  wire [$clog2(DEPTH)-1:0] wr_addr,
+    input  wire [DATA_W-1:0]        wr_data,
 
-    // Read port
-    input  wire        in_rd_en,
-    output wire [23:0] out_data
+    input  wire [$clog2(DEPTH)-1:0] rd_addr,
+    output reg  [DATA_W-1:0]        rd_data
 );
 
-    reg [7:0] mem [0:LINE_LEN-1];
-
-    reg [$clog2(LINE_LEN)-1:0] wrPtr;
-
-    reg [$clog2(LINE_LEN)-1:0] rdPtr;
+    (* ram_style = "block" *)
+    reg [DATA_W-1:0] mem [0:DEPTH-1];
 
     always @(posedge clk) begin
-        if (rst) begin
-            wrPtr <= {($clog2(LINE_LEN)){1'b0}};
-        end else if (in_wr_en) begin
-            mem[wrPtr] <= in_data;
-            wrPtr <= (wrPtr == LINE_LEN - 1) ? {($clog2(LINE_LEN)){1'b0}} : wrPtr + 1'b1;
-        end
+        if (wr_en)
+            mem[wr_addr] <= wr_data;
     end
 
     always @(posedge clk) begin
-        if (rst) begin
-            rdPtr <= {($clog2(LINE_LEN)){1'b0}};
-        end else if (in_rd_en) begin
-            rdPtr <= (rdPtr == LINE_LEN - 1) ? {($clog2(LINE_LEN)){1'b0}} : rdPtr + 1'b1;
-        end
+        rd_data <= mem[rd_addr];
     end
-
-    //2nd and 3rd pixel pointers
-    wire [$clog2(LINE_LEN)-1:0] rdPtr1 = (rdPtr == LINE_LEN - 1) ? {($clog2(LINE_LEN)){1'b0}} : rdPtr + 1'b1;
-    wire [$clog2(LINE_LEN)-1:0] rdPtr2 = (rdPtr >= LINE_LEN - 2) ? rdPtr - (LINE_LEN - 2) : rdPtr + 2'd2;
-
-    assign out_data = {mem[rdPtr2], mem[rdPtr1], mem[rdPtr]};
 
 endmodule

@@ -1,62 +1,56 @@
+// Observes the DUT's AXI4-Stream output: every accepted beat is written to
+// <DIR>/out.raw and sent to the scoreboard. Also counts out_intr pulses.
 class tb_monitor extends uvm_monitor;
     `uvm_component_utils(tb_monitor)
-    
+
     virtual tb_stream_if vif;
+    tb_config            cfg;
     uvm_analysis_port #(tb_transaction) ap;
-    
-    int input_file;
-    int output_file;
-    
-    
+
+    int intr_count;
+    int out_file;
+
     function new(string name, uvm_component parent);
         super.new(name, parent);
     endfunction
-    
+
     function void build_phase(uvm_phase phase);
         super.build_phase(phase);
         ap = new("ap", this);
-        if(!uvm_config_db #(virtual tb_stream_if)::get(this, "", "vif", vif))
+        if (!uvm_config_db #(virtual tb_stream_if)::get(this, "", "vif", vif))
             `uvm_fatal("NO_VIF", "Monitor could not get virtual interface")
+        if (!uvm_config_db #(tb_config)::get(this, "", "cfg", cfg))
+            `uvm_fatal("NO_CFG", "Monitor could not get tb_config")
     endfunction
-    
+
     task run_phase(uvm_phase phase);
         tb_transaction tx;
-        byte unsigned header_byte;
-        int i;
-        
-        `uvm_info("MON", "run_phase started", UVM_LOW)
-        
-        input_file = $fopen("input.bmp", "rb");
-        if(input_file == 0)
-            `uvm_fatal("MON", "Monitor could not open input.bmp to read header")
-        `uvm_info("MON", "input.bmp opened successfully", UVM_LOW)
-        
-        output_file = $fopen("output.bmp", "wb");
-        if(output_file == 0)
-            `uvm_fatal("MON", "Monitor could not open output.bmp for writing")
-        `uvm_info("MON", "output.bmp opened successfully", UVM_LOW)
-        
-        for(i = 0; i < 1080; i++) begin
-            $fscanf(input_file, "%c", header_byte);
-            $fwrite(output_file, "%c", header_byte);
-        end
-        $fclose(input_file);
-        `uvm_info("MON", "Header copied successfully", UVM_LOW)
-        
+        out_file = $fopen({cfg.dir, "/out.raw"}, "wb");
+        if (out_file == 0)
+            `uvm_fatal("MON", $sformatf("cannot create %s/out.raw", cfg.dir))
         forever begin
             @(posedge vif.clk);
-            if(vif.out_data_valid) begin
+            if (vif.aresetn !== 1'b1)
+                continue;
+            if (vif.out_intr === 1'b1)
+                intr_count++;
+            if (vif.m_tvalid === 1'b1 && vif.m_tready === 1'b1) begin
                 tx = tb_transaction::type_id::create("tx");
-                tx.tb_data = vif.out_data;
-                $fwrite(output_file, "%c", tx.tb_data);
+                tx.data = vif.m_tdata;
+                tx.user = vif.m_tuser;
+                tx.last = vif.m_tlast;
+                for (int c = 0; c < cfg.channels; c++)
+                    $fwrite(out_file, "%c", tx.data[c*8 +: 8]);
                 ap.write(tx);
+                if ($isunknown({vif.m_tdata, vif.m_tuser, vif.m_tlast}))
+                    `uvm_error("MON", "X/Z on m_axis during a transfer")
             end
-        end 
+        end
     endtask
-    
+
     function void final_phase(uvm_phase phase);
         super.final_phase(phase);
-        $fclose(output_file);
+        if (out_file != 0)
+            $fclose(out_file);
     endfunction
-    
 endclass

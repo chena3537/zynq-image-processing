@@ -3,130 +3,221 @@
 // Module Name: ImageProcessTop
 //
 // Description:
-// Top-level AXI4-Stream wrapper for the 3x3 image convolution pipeline.
+// 3x3 convolution core with AXI4-Stream Video in and out (UG934:
+// tuser = start of frame, tlast = end of line) and an AXI4-Lite control
+// port. A WIDTH x HEIGHT frame in produces a WIDTH x HEIGHT frame out,
+// with edge pixels replicated at the borders.
 //
-// Connects three pipeline stages:
-//   BufferCtrl  ->  Conv  ->  outputBuffer (Xilinx FIFO IP)
+//   s_axis -> WindowGen -> Conv -> OutputFifo -> m_axis
 //
-// Ports follow AXI4-Stream naming conventions (s_axis_t*, m_axis_t*).
-// aresetn is active-low; internal logic uses active-high rst = ~aresetn.
-// s_axis_tready is deasserted when the output FIFO asserts axis_prog_full.
+// Throughput: one pixel per clock, plus one idle input cycle per line and
+// one idle input line per frame (used to finish the right and bottom
+// borders). Fits within video blanking.
+//
+// Back-pressure: the pipeline never stalls. A credit counter tracks windows
+// issued but not yet sent on m_axis; new work is issued only while it is
+// below the FIFO depth, so the FIFO can never overflow. s_axis_tready
+// depends only on registers, not combinationally on m_axis_tready.
+//
+// Kernel selection: board switches sw[1:0] (synchronised here) or the
+// CTRL register; see ControlRegs for the register map. The selected kernel
+// is sampled at each start of frame.
+//
+// out_intr pulses for one cycle when the last pixel of a frame is sent.
+// Single clock domain: all ports are synchronous to aclk.
 //////////////////////////////////////////////////////////////////////////////////
 
 module ImageProcessTop #(
-    parameter LINE_LEN = 512,
-    parameter NUM_ROWS = 512
+    parameter WIDTH    = 512,
+    parameter HEIGHT   = 512,
+    parameter CHANNELS = 1      // 1 = 8-bit grey, 3 = 24-bit RGB
 )(
-    input  wire        aclk,
-    input  wire        aresetn,
+    input  wire                   aclk,
+    input  wire                   aresetn,
 
-    input  wire        s_axis_tvalid,
-    input  wire [7:0]  s_axis_tdata,
-    input  wire [1:0]  sw,
-    output wire        s_axis_tready,
+    // AXI4-Stream Video input
+    input  wire [CHANNELS*8-1:0]  s_axis_tdata,
+    input  wire                   s_axis_tvalid,
+    output wire                   s_axis_tready,
+    input  wire                   s_axis_tuser,
+    input  wire                   s_axis_tlast,
 
-    output wire        m_axis_tvalid,
-    output wire [7:0]  m_axis_tdata,
-    output wire        m_axis_tlast,
-    input  wire        m_axis_tready,
+    // AXI4-Stream Video output
+    output wire [CHANNELS*8-1:0]  m_axis_tdata,
+    output wire                   m_axis_tvalid,
+    input  wire                   m_axis_tready,
+    output wire                   m_axis_tuser,
+    output wire                   m_axis_tlast,
 
-    // Interrupt: pulses one cycle per completed 512-pixel read pass
-    output wire        out_intr
+    // AXI4-Lite control
+    input  wire [4:0]             s_axi_ctrl_awaddr,
+    input  wire                   s_axi_ctrl_awvalid,
+    output wire                   s_axi_ctrl_awready,
+    input  wire [31:0]            s_axi_ctrl_wdata,
+    input  wire [3:0]             s_axi_ctrl_wstrb,
+    input  wire                   s_axi_ctrl_wvalid,
+    output wire                   s_axi_ctrl_wready,
+    output wire [1:0]             s_axi_ctrl_bresp,
+    output wire                   s_axi_ctrl_bvalid,
+    input  wire                   s_axi_ctrl_bready,
+    input  wire [4:0]             s_axi_ctrl_araddr,
+    input  wire                   s_axi_ctrl_arvalid,
+    output wire                   s_axi_ctrl_arready,
+    output wire [31:0]            s_axi_ctrl_rdata,
+    output wire [1:0]             s_axi_ctrl_rresp,
+    output wire                   s_axi_ctrl_rvalid,
+    input  wire                   s_axi_ctrl_rready,
+
+    // Board switches (asynchronous)
+    input  wire [1:0]             sw,
+
+    // One-cycle pulse per completed output frame
+    output reg                    out_intr
 );
 
-    // Internal active-high reset (invert AXI active-low)
-    wire rst = ~aresetn;
+    localparam FIFO_DEPTH = 32;
+    localparam PW         = CHANNELS * 8;
 
-    wire [71:0] pixel_window;
-    wire        pixel_window_valid;
+    reg rst;
+    always @(posedge aclk)
+        rst <= ~aresetn;
 
-    wire [7:0]  conv_data;
-    wire        conv_data_valid;
-
-    reg  [1:0]  kernel_select_latched;
-    reg  [1:0]  kernel_select_pending;
-
-    wire        fifo_prog_full;
-    wire        frame_end_transfer;
-
-
-
-    localparam FRAME_SIZE = LINE_LEN * NUM_ROWS;        
-    localparam CNT_W      = $clog2(FRAME_SIZE);      
- 
-    reg [CNT_W-1:0] out_pixel_cnt;               
- 
-    always @(posedge aclk) begin                           
-        if (~aresetn) begin                                  
-            out_pixel_cnt <= {CNT_W{1'b0}};                     
-        end else if (m_axis_tvalid && m_axis_tready) begin        
-            // Advance only on completed transfers (both sides ready)
-            if (out_pixel_cnt == FRAME_SIZE - 1)
-                out_pixel_cnt <= {CNT_W{1'b0}};
-            else
-                out_pixel_cnt <= out_pixel_cnt + 1'b1;
-        end                                                      
-    end                                                            
- 
-    // Assert tlast only on the last pixel of the frame
-    assign m_axis_tlast = m_axis_tvalid &&                         
-                          (out_pixel_cnt == FRAME_SIZE - 1);
-
-    assign frame_end_transfer = m_axis_tvalid && m_axis_tready && m_axis_tlast;
-
-    // Capture switch state continuously, but only apply it to the active
-    // kernel selector after the final output pixel of each frame transfers.
+    // -------------------------------------------------------------------------
+    // Switch synchroniser
+    // -------------------------------------------------------------------------
+    (* ASYNC_REG = "TRUE" *) reg [1:0] sw_meta, sw_sync;
     always @(posedge aclk) begin
-        if (rst) begin
-            kernel_select_latched <= sw[1:0];
-            kernel_select_pending <= sw[1:0];
-        end else begin
-            kernel_select_pending <= sw[1:0];
-            if (frame_end_transfer)
-                kernel_select_latched <= kernel_select_pending;
-        end
+        sw_meta <= sw;
+        sw_sync <= sw_meta;
     end
 
+    // -------------------------------------------------------------------------
+    // Pipeline
+    // -------------------------------------------------------------------------
+    wire [2:0]          kernel_sel;
+    wire                issue_en;
+    wire                issue_out;
+    wire                sync_err;
+    wire                in_frame;
 
-    // Back-pressure: tell the source to pause when the output FIFO is nearly full
-    assign s_axis_tready = ~fifo_prog_full;
+    wire [9*PW-1:0]     win_data;
+    wire                win_valid, win_user, win_last, win_eof;
+    wire [2:0]          win_kernel;
 
-    BufferCtrl #(
-        .LINE_LEN  (LINE_LEN),
-        .NUM_LINES (4)
-    ) u_BufferCtrl (
-        .clk                  (aclk),
-        .rst                  (rst),
-        .in_pixel_data        (s_axis_tdata),
-        .in_pixel_data_valid  (s_axis_tvalid),
-        .out_pixel_data       (pixel_window),
-        .out_pixel_data_valid (pixel_window_valid),
-        .out_intr             (out_intr)
+    wire [PW-1:0]       conv_data;
+    wire                conv_valid, conv_user, conv_last, conv_eof;
+
+    WindowGen #(
+        .WIDTH    (WIDTH),
+        .HEIGHT   (HEIGHT),
+        .CHANNELS (CHANNELS)
+    ) u_WindowGen (
+        .clk        (aclk),
+        .rst        (rst),
+        .s_tdata    (s_axis_tdata),
+        .s_tvalid   (s_axis_tvalid),
+        .s_tready   (s_axis_tready),
+        .s_tuser    (s_axis_tuser),
+        .s_tlast    (s_axis_tlast),
+        .issue_en   (issue_en),
+        .kernel_sel (kernel_sel),
+        .issue_out  (issue_out),
+        .win_data   (win_data),
+        .win_valid  (win_valid),
+        .win_user   (win_user),
+        .win_last   (win_last),
+        .win_eof    (win_eof),
+        .win_kernel (win_kernel),
+        .sync_err   (sync_err),
+        .in_frame   (in_frame)
     );
 
     Conv #(
-        .NUM_TAPS (9)
+        .CHANNELS (CHANNELS)
     ) u_Conv (
-        .clk                 (aclk),
-        .kernel_select       (kernel_select_latched),
-        .in_pixel_data       (pixel_window),
-        .in_pixel_data_valid (pixel_window_valid),
-        .out_conv_data       (conv_data),
-        .out_conv_data_valid (conv_data_valid)
+        .clk       (aclk),
+        .rst       (rst),
+        .in_data   (win_data),
+        .in_valid  (win_valid),
+        .in_user   (win_user),
+        .in_last   (win_last),
+        .in_eof    (win_eof),
+        .in_kernel (win_kernel),
+        .out_data  (conv_data),
+        .out_valid (conv_valid),
+        .out_user  (conv_user),
+        .out_last  (conv_last),
+        .out_eof   (conv_eof)
     );
 
-    outputBuffer u_outputBuffer (
-        .wr_rst_busy   (),
-        .rd_rst_busy   (),
-        .s_aclk        (aclk),
-        .s_aresetn     (aresetn),
-        .s_axis_tvalid (conv_data_valid),
-        .s_axis_tready (),
-        .s_axis_tdata  (conv_data),
-        .m_axis_tvalid (m_axis_tvalid),
-        .m_axis_tready (m_axis_tready),
-        .m_axis_tdata  (m_axis_tdata),
-        .axis_prog_full(fifo_prog_full)
+    wire          fifo_eof;
+    wire          out_fire = m_axis_tvalid && m_axis_tready;
+
+    OutputFifo #(
+        .DEPTH  (FIFO_DEPTH),
+        .DATA_W (PW + 3)
+    ) u_OutputFifo (
+        .clk      (aclk),
+        .rst      (rst),
+        .wr_en    (conv_valid),
+        .wr_data  ({conv_eof, conv_last, conv_user, conv_data}),
+        .rd_valid (m_axis_tvalid),
+        .rd_data  ({fifo_eof, m_axis_tlast, m_axis_tuser, m_axis_tdata}),
+        .rd_en    (m_axis_tready)
+    );
+
+    // -------------------------------------------------------------------------
+    // Credit counter: windows issued and not yet sent on m_axis
+    // -------------------------------------------------------------------------
+    reg [$clog2(FIFO_DEPTH):0] credits_used;
+
+    assign issue_en = (credits_used < FIFO_DEPTH);
+
+    always @(posedge aclk) begin
+        if (rst)
+            credits_used <= 0;
+        else
+            credits_used <= credits_used + issue_out - out_fire;
+    end
+
+    always @(posedge aclk) begin
+        if (rst)
+            out_intr <= 1'b0;
+        else
+            out_intr <= out_fire && fifo_eof;
+    end
+
+    // -------------------------------------------------------------------------
+    // Control registers
+    // -------------------------------------------------------------------------
+    ControlRegs #(
+        .WIDTH  (WIDTH),
+        .HEIGHT (HEIGHT)
+    ) u_ControlRegs (
+        .clk           (aclk),
+        .rst           (rst),
+        .s_axi_awaddr  (s_axi_ctrl_awaddr),
+        .s_axi_awvalid (s_axi_ctrl_awvalid),
+        .s_axi_awready (s_axi_ctrl_awready),
+        .s_axi_wdata   (s_axi_ctrl_wdata),
+        .s_axi_wstrb   (s_axi_ctrl_wstrb),
+        .s_axi_wvalid  (s_axi_ctrl_wvalid),
+        .s_axi_wready  (s_axi_ctrl_wready),
+        .s_axi_bresp   (s_axi_ctrl_bresp),
+        .s_axi_bvalid  (s_axi_ctrl_bvalid),
+        .s_axi_bready  (s_axi_ctrl_bready),
+        .s_axi_araddr  (s_axi_ctrl_araddr),
+        .s_axi_arvalid (s_axi_ctrl_arvalid),
+        .s_axi_arready (s_axi_ctrl_arready),
+        .s_axi_rdata   (s_axi_ctrl_rdata),
+        .s_axi_rresp   (s_axi_ctrl_rresp),
+        .s_axi_rvalid  (s_axi_ctrl_rvalid),
+        .s_axi_rready  (s_axi_ctrl_rready),
+        .sw_sync       (sw_sync),
+        .kernel_sel    (kernel_sel),
+        .sync_err      (sync_err),
+        .in_frame      (in_frame),
+        .frame_done    (out_intr)
     );
 
 endmodule
