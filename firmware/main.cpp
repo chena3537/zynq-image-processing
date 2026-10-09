@@ -1,10 +1,14 @@
 // =============================================================================
 // Image pipeline firmware (Arty Z7-20, bare metal)
 //
-// Receives a greyscale frame over the USB-UART, streams it through the PL
-// convolution core with the AXI DMA (MM2S -> AxisFramer -> ImageProcessTop
-// -> AxisDeframer -> S2MM), and sends the result back. Requests are served
-// in a loop; scripts/hw_test.py is the host side.
+// Two jobs, served in a loop over the USB-UART:
+//  - Image requests: receive a greyscale frame, stream it through the
+//    harness core with the AXI DMA (MM2S -> AxisFramer -> ImageProcessTop_0
+//    -> AxisDeframer -> S2MM) and send the result back (scripts/hw_test.py).
+//  - Video requests: report the HDMI path's status and optionally select the
+//    kernel of the 720p video core ImageProcessTop_1 (scripts/video_ctl.py).
+//    The video path runs without the firmware; at reset its kernel follows
+//    the board switches.
 //
 // UART: 921600 baud, 8N1. Nothing else is printed once requests start, so
 // the byte stream carries only protocol data.
@@ -20,6 +24,16 @@
 // to completion. For RX_TIMEOUT, bits [23:0] = request bytes received after
 // the magic, bits [31:24] = UART receive errors (bit 0 overrun, bit 1
 // framing, bit 2 parity). Otherwise 0.
+//
+// Video request:  "ZVID" | kernel u8   (0..4 select via CTRL, 0xFF = follow
+//                                       the switches, 0xFE = status only,
+//                                       0xFD = pulse hot-plug detect)
+// Video response: "ZVST" | status u8 | locked u8 | frames u32 | core_status u32
+//                 | core_ctrl u32
+// locked: bit 0 HDMI input clock locked, bit 1 HDMI output locked. The video
+// core's registers are only accessed while the input clock is locked (its
+// clock comes from the HDMI input); otherwise frames, core_status and
+// core_ctrl are 0, and a kernel change is refused with NO_VIDEO.
 // =============================================================================
 
 #include <string.h>
@@ -48,6 +62,25 @@
 #else
 #define CORE_BASEADDR    0x43C00000U  // bd/image_pipeline.tcl address map
 #endif
+#ifdef XPAR_IMAGEPROCESSTOP_1_BASEADDR
+#define VIDEO_BASEADDR   XPAR_IMAGEPROCESSTOP_1_BASEADDR
+#else
+#define VIDEO_BASEADDR   0x43C10000U
+#endif
+#ifdef XPAR_XGPIO_0_BASEADDR
+#define GPIO_BASEADDR    XPAR_XGPIO_0_BASEADDR
+#else
+#define GPIO_BASEADDR    0x41200000U
+#endif
+#define GPIO_DATA        0x00         // channel 1 (inputs): lock status
+#define GPIO2_DATA       0x08         // channel 2 (output): HDMI RX hot-plug detect
+#define VIDEO_IN_LOCKED  0x1          // GPIO bit 0: dvi2rgb pixel clock locked
+#define VIDEO_OUT_LOCKED 0x2          // GPIO bit 1: v_axi4s_vid_out locked
+
+#define KERNEL_SWITCHES  0xFF         // video request: follow the board switches
+#define KERNEL_KEEP      0xFE         // video request: status only
+#define KERNEL_REPLUG    0xFD         // video request: pulse hot-plug detect
+#define HPD_LOW_US       500000U      // long enough for sources to see a replug
 
 // ImageProcessTop registers (rtl/ControlRegs.v)
 #define CORE_CTRL        0x00
@@ -76,6 +109,7 @@ enum Status : u8 {
     ST_SYNC_ERROR  = 6,   // core saw a malformed frame
     ST_SHORT_FRAME = 7,   // S2MM received the wrong number of bytes
     ST_RX_TIMEOUT  = 8,   // request stopped arriving before it was complete
+    ST_NO_VIDEO    = 9,   // video core not clocked (no HDMI input)
 };
 
 static XAxiDma axidma;
@@ -163,26 +197,32 @@ static void put_u32(u8* p, u32 v) { for (int i = 0; i < 4; i++) p[i] = (v >> (8 
 static u16  get_u16(const u8* p)  { return p[0] | (p[1] << 8); }
 static u32  get_u32(const u8* p)  { return p[0] | (p[1] << 8) | (p[2] << 16) | ((u32)p[3] << 24); }
 
-// Block until the 4-byte request magic has been received.
-static void wait_for_magic()
+enum Request { REQ_IMAGE, REQ_VIDEO };
+
+// Block until a request magic ("ZIMG" or "ZVID") has been received.
+static Request wait_for_request()
 {
-    static const u8 magic[4] = {'Z', 'I', 'M', 'G'};
-    u32 matched = 0;
-    while (matched < 4) {
+    u8 window[4] = {0, 0, 0, 0};
+    for (;;) {
         while (!XUartPs_IsReceiveData(UART_BASEADDR))
             ;
-        u8 b = XUartPs_RecvByte(UART_BASEADDR);
-        if (b == magic[matched])
-            matched++;
-        else
-            matched = (b == magic[0]) ? 1 : 0;
+        window[0] = window[1];
+        window[1] = window[2];
+        window[2] = window[3];
+        window[3] = XUartPs_RecvByte(UART_BASEADDR);
+        if (memcmp(window, "ZIMG", 4) == 0)
+            return REQ_IMAGE;
+        if (memcmp(window, "ZVID", 4) == 0)
+            return REQ_VIDEO;
     }
 }
 
 // --- PL and DMA -----------------------------------------------------------------
 // Pulse FCLK_RESET0_N: resets the DMA, interconnect and the whole image
 // pipeline (core, framer, deframer) so a failed transfer cannot leave them
-// out of step with the next frame.
+// out of step with the next frame. It also resets the video path, which
+// briefly blanks the HDMI output; it is only used at start-up and after a
+// DMA failure.
 static void pl_reset()
 {
     Xil_Out32(SLCR_UNLOCK, SLCR_UNLOCK_KEY);
@@ -325,8 +365,63 @@ static void handle_request()
     if (status == ST_DMA_ERROR || status == ST_DMA_TIMEOUT || status == ST_SHORT_FRAME) {
         pl_reset();                              // start the next frame clean
         dma_init();
+        Xil_Out32(GPIO_BASEADDR + GPIO2_DATA, 1);  // reset dropped hot-plug detect
     }
     send_response(status, width, height, elapsed_us, pixels);
+}
+
+// Hot-plug detect tells the HDMI source a display is attached; the source
+// then reads the EDID (served by dvi2rgb). Raise it only once the PL is out
+// of reset and the EDID emulation can answer, after holding it low long
+// enough to count as an unplug, so the source re-reads the 720p EDID.
+static void hdmi_hotplug()
+{
+    Xil_Out32(GPIO_BASEADDR + GPIO2_DATA, 0);
+    usleep(HPD_LOW_US);
+    Xil_Out32(GPIO_BASEADDR + GPIO2_DATA, 1);
+}
+
+static u32  video_read(u32 reg)         { return Xil_In32(VIDEO_BASEADDR + reg); }
+static void video_write(u32 reg, u32 v) { Xil_Out32(VIDEO_BASEADDR + reg, v); }
+
+static void handle_video_request()
+{
+    u8 kernel;
+    if (!uart_get(&kernel))
+        return;
+
+    if (kernel == KERNEL_REPLUG) {
+        hdmi_hotplug();
+        kernel = KERNEL_KEEP;
+    }
+
+    u8  status = ST_OK;
+    u32 locked = Xil_In32(GPIO_BASEADDR + GPIO_DATA) & (VIDEO_IN_LOCKED | VIDEO_OUT_LOCKED);
+    u32 frames = 0, core_status = 0, core_ctrl = 0;
+
+    // Without the HDMI input clock the video core is unclocked and an access
+    // would stall the bus, so only touch it while the input is locked.
+    if (locked & VIDEO_IN_LOCKED) {
+        if (kernel == KERNEL_SWITCHES)
+            video_write(CORE_CTRL, 0);
+        else if (kernel < NUM_KERNELS)
+            video_write(CORE_CTRL, (kernel << 4) | CTRL_KERNEL_REG);
+        else if (kernel != KERNEL_KEEP)
+            status = ST_BAD_KERNEL;
+        frames      = video_read(CORE_FRAMES);
+        core_status = video_read(CORE_STATUS);
+        core_ctrl   = video_read(CORE_CTRL);
+    } else if (kernel != KERNEL_KEEP) {
+        status = ST_NO_VIDEO;
+    }
+
+    u8 rsp[18] = {'Z', 'V', 'S', 'T'};
+    rsp[4] = status;
+    rsp[5] = (u8)locked;
+    put_u32(&rsp[6], frames);
+    put_u32(&rsp[10], core_status);
+    put_u32(&rsp[14], core_ctrl);
+    uart_put_n(rsp, sizeof(rsp));
 }
 
 int main()
@@ -358,12 +453,17 @@ int main()
         return XST_FAILURE;
     }
 
+    hdmi_hotplug();                                // HDMI source reads our EDID
+
     while (XUartPs_IsReceiveData(UART_BASEADDR))   // drop anything stale
         (void)XUartPs_RecvByte(UART_BASEADDR);
 
     for (;;) {
-        wait_for_magic();
+        Request req = wait_for_request();
         (void)uart_take_errors();                  // count errors per request
-        handle_request();
+        if (req == REQ_IMAGE)
+            handle_request();
+        else
+            handle_video_request();
     }
 }

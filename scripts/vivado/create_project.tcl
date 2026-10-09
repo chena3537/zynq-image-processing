@@ -50,8 +50,20 @@ foreach xci [glob -nocomplain -directory [file join $REPO_ROOT ip] *.xci] {
     import_ip $xci
 }
 
+# Digilent IP (dvi2rgb, rgb2dvi) from the ip/digilent submodule
+set DIGILENT_IP [file join $REPO_ROOT ip digilent]
+if {![file exists [file join $DIGILENT_IP ip dvi2rgb component.xml]]} {
+    error "Digilent IP not found in $DIGILENT_IP; run: git submodule update --init"
+}
+set_property ip_repo_paths [list $DIGILENT_IP] [current_project]
+update_ip_catalog
+
 add_files -norecurse -fileset constrs_1 \
     [file join $REPO_ROOT constraints imageproc_active_io.xdc]
+# Refers to clocks created by IP constraints, so implementation only
+set timing_xdc [file join $REPO_ROOT constraints imageproc_timing.xdc]
+add_files -norecurse -fileset constrs_1 $timing_xdc
+set_property used_in_synthesis false [get_files $timing_xdc]
 
 update_compile_order -fileset sources_1
 

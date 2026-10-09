@@ -50,6 +50,7 @@ STATUS = {
     6: "SYNC_ERROR (core saw a malformed frame)",
     7: "SHORT_FRAME (S2MM received the wrong byte count)",
     8: "RX_TIMEOUT (request stopped arriving)",
+    9: "NO_VIDEO (no HDMI input clock)",
 }
 
 
