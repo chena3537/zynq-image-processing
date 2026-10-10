@@ -213,7 +213,7 @@ through CRCs and retries the frame, and pipeline results are unaffected.
 
 ## PS-PL System Integration
 
-![PS-PL block design](docs/block_diagram.png)
+![PS-PL block design](docs/block_diagram.svg)
 *Vivado block design — the HDMI video path (dvi2rgb, video in, ImageProcessTop_1,
 video out, rgb2dvi) and the still-image path (AXI DMA, AxisFramer,
 ImageProcessTop_0, AxisDeframer); the PS controls both cores over AXI4-Lite.*
