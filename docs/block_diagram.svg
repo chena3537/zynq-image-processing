@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8" standalone="no"?>
-<svg viewBox="0 0 1320 3002"
+<svg viewBox="0 0 3002 1320"
      preserveAspectRatio="xMidYMid meet"
      version="1.1"
      baseProfile="full"
@@ -25,7 +25,6 @@
    font-size="12"
    writing-mode="lr-tb"
    cursor="crosshair"
-   transform="rotate(-90) translate(-3002)"
    clip-path="url(#clippingbbox)">
 <path d="M0 0h3002v1321h-3002z" stroke="none" fill="white" />
 <path d="M101 250l-7 7h-14v-14h14z" stroke="none" fill="#ddd4d0" />
